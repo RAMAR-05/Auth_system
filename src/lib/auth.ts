@@ -3,9 +3,52 @@ import { prismaAdapter } from "better-auth/adapters/prisma";
 import { prisma } from "@/lib/prisma";
 import { username } from "better-auth/plugins/username";
 import { emailOTP } from "better-auth/plugins";
-import { Resend } from "resend";
+import nodemailer from "nodemailer";
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+// ============================================================
+// Gmail configuration
+// ============================================================
+
+const gmailUser = process.env.GMAIL_USER;
+const gmailAppPassword = process.env.GMAIL_APP_PASSWORD;
+
+if (!gmailUser) {
+  throw new Error("GMAIL_USER is missing in environment variables");
+}
+
+if (!gmailAppPassword) {
+  throw new Error("GMAIL_APP_PASSWORD is missing in environment variables");
+}
+
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: gmailUser,
+    pass: gmailAppPassword,
+  },
+});
+
+// ============================================================
+// Test Gmail SMTP connection
+// ============================================================
+
+transporter.verify((error, success) => {
+  if (error) {
+    console.error("================================");
+    console.error("❌ GMAIL SMTP CONNECTION FAILED");
+    console.error(error);
+    console.error("================================");
+  } else {
+    console.log("================================");
+    console.log("✅ GMAIL SMTP CONNECTION READY");
+    console.log(success);
+    console.log("================================");
+  }
+});
+
+// ============================================================
+// Better Auth
+// ============================================================
 
 export const auth = betterAuth({
   baseURL: process.env.BETTER_AUTH_URL,
@@ -14,6 +57,10 @@ export const auth = betterAuth({
     provider: "postgresql",
   }),
 
+  // ==========================================================
+  // Email + Password
+  // ==========================================================
+
   emailAndPassword: {
     enabled: true,
     autoSignIn: false,
@@ -21,10 +68,18 @@ export const auth = betterAuth({
     revokeSessionsOnPasswordReset: true,
   },
 
+  // ==========================================================
+  // Email verification
+  // ==========================================================
+
   emailVerification: {
     sendOnSignUp: false,
     autoSignInAfterVerification: true,
   },
+
+  // ==========================================================
+  // Google OAuth
+  // ==========================================================
 
   socialProviders: {
     google: {
@@ -33,19 +88,31 @@ export const auth = betterAuth({
     },
   },
 
-  // Only protects requests that go through Better Auth's own HTTP
-  // handler directly (sign-in, sign-up, OAuth, etc.) — your custom
-  // OTP/reset routes are covered separately by lib/rate-limit.ts,
-  // since Better Auth explicitly does NOT rate-limit auth.api calls.
+  // ==========================================================
+  // Better Auth HTTP rate limiting
+  // ==========================================================
+
   rateLimit: {
-    enabled: true, // off by default outside production — this makes it explicit and consistent across environments
+    enabled: true,
     window: 60,
     max: 100,
+
     customRules: {
-      "/sign-in/email": { window: 900, max: 5 }, // 5 attempts / 15 min
-      "/sign-up/email": { window: 3600, max: 10 }, // 10 attempts / 60 min
+      "/sign-in/email": {
+        window: 900,
+        max: 5,
+      },
+
+      "/sign-up/email": {
+        window: 3600,
+        max: 10,
+      },
     },
   },
+
+  // ==========================================================
+  // Maximum 4 active sessions per user
+  // ==========================================================
 
   databaseHooks: {
     session: {
@@ -56,14 +123,21 @@ export const auth = betterAuth({
           const sessionsToDelete = await prisma.session.findMany({
             where: {
               userId: session.userId,
+
+              // Only count sessions that are still active.
               expiresAt: {
                 gt: new Date(),
               },
             },
+
+            // Newest sessions first.
             orderBy: {
               createdAt: "desc",
             },
+
+            // Keep newest 4.
             skip: maxSessions,
+
             select: {
               id: true,
             },
@@ -80,21 +154,55 @@ export const auth = betterAuth({
               },
             },
           });
+
+          console.log(
+            `🗑️ Removed ${sessionsToDelete.length} old session(s) for user ${session.userId}`
+          );
         },
       },
     },
   },
 
+  // ==========================================================
+  // Plugins
+  // ==========================================================
+
   plugins: [
     username(),
 
     emailOTP({
+      // OTP valid for 5 minutes
       expiresIn: 300,
+
+      // Maximum verification attempts
       allowedAttempts: 5,
+
+      // 6 digit OTP
       otpLength: 6,
+
+      // New OTP invalidates/rotates the previous one
       resendStrategy: "rotate",
+
+      // OTP is stored hashed
       storeOTP: "hashed",
+
+      // ========================================================
+      // Send OTP through Gmail using Nodemailer
+      // ========================================================
+
       async sendVerificationOTP({ email, otp, type }) {
+        console.log("================================");
+        console.log("📨 OTP EMAIL REQUEST");
+        console.log("Recipient:", email);
+        console.log("Type:", type);
+
+        // DEVELOPMENT ONLY
+        if (process.env.NODE_ENV !== "production") {
+          console.log("🔐 OTP:", otp);
+        }
+
+        console.log("================================");
+
         const subject =
           type === "email-verification"
             ? "Verify your email"
@@ -102,28 +210,29 @@ export const auth = betterAuth({
               ? "Reset your password"
               : "Your sign-in code";
 
-        // Fire-and-forget on purpose (per Better Auth's own docs):
-        // don't await the send, to avoid a timing side-channel that
-        // could leak whether an email exists based on response
-        // latency. On serverless (Vercel), wrap it in waitUntil so
-        // the function doesn't get frozen/killed before the send
-        // completes.
-        const send = resend.emails.send({
-          from: "Your App <noreply@yourdomain.com>", // TODO: replace with your actual Resend-verified domain
+        const send = transporter.sendMail({
+          from: `Your App <${gmailUser}>`,
           to: email,
           subject,
           text: `Your code is ${otp}. It expires in 5 minutes.`,
         });
 
-        // If deployed on Vercel:
-        // import { waitUntil } from "@vercel/functions";
-        // waitUntil(send);
-
-        // Otherwise, at minimum log failures so a broken email
-        // integration doesn't fail silently:
-        send.catch((error) => {
-          console.error("Failed to send OTP email:", error);
-        });
+        // Log successful email sending
+        send
+          .then((info) => {
+            console.log("================================");
+            console.log("✅ OTP EMAIL SENT");
+            console.log("Message ID:", info.messageId);
+            console.log("To:", email);
+            console.log("================================");
+          })
+          .catch((error) => {
+            console.error("================================");
+            console.error("❌ FAILED TO SEND OTP EMAIL");
+            console.error("Recipient:", email);
+            console.error(error);
+            console.error("================================");
+          });
       },
     }),
   ],
